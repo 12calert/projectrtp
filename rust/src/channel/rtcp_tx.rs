@@ -106,6 +106,11 @@ fn build_report(state: &ChannelState, bye: bool) -> Vec<u8> {
 /// datagram goes out on the RTP socket (shared 5-tuple), otherwise on the P+1
 /// control socket.
 async fn send_compound(state: &mut ChannelState, compound: &[u8], remote: SocketAddr) {
+    // Don't emit cleartext RTCP on a DTLS channel whose keys aren't ready —
+    // same no-downgrade rule as the RTP send path.
+    if state.secure_not_ready() {
+        return;
+    }
     // Clone the Arc up front so the socket borrow doesn't collide with the
     // mutable `state.srtp_encrypt` borrow below.
     let sock = if state.rtcpmux {
@@ -139,7 +144,7 @@ fn next_unit(rng: &mut u64) -> f64 {
     x ^= x << 25;
     x ^= x >> 27;
     *rng = x;
-    let v = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    let v = x.wrapping_mul(0x2545F4914F6CDD1D);
     (v >> 11) as f64 / (1u64 << 53) as f64
 }
 
@@ -149,21 +154,21 @@ mod tests {
 
     #[test]
     fn interval_stays_within_rfc_bounds() {
-        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut rng = 0x123456789abcdef0u64;
         let lo = (RTCP_MIN_INTERVAL_TICKS as f64 * 0.5 / RTCP_COMPENSATION) as u64;
         let hi = (RTCP_MIN_INTERVAL_TICKS as f64 * 1.5 / RTCP_COMPENSATION) as u64;
         for _ in 0..100_000 {
             let t = next_interval_ticks(&mut rng);
-            assert!(t >= lo && t <= hi, "interval {t} out of [{lo},{hi}]");
+            assert!(t >= lo && t <= hi, "interval {} out of [{},{}]", t, lo, hi);
         }
     }
 
     #[test]
     fn unit_is_in_unit_interval() {
-        let mut rng = 0x0fed_cba9_8765_4321u64;
+        let mut rng = 0x0fedcba987654321u64;
         for _ in 0..100_000 {
             let u = next_unit(&mut rng);
-            assert!((0.0..1.0).contains(&u), "unit {u} out of [0,1)");
+            assert!((0.0..1.0).contains(&u), "unit {} out of [0,1)", u);
         }
     }
 }
