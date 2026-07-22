@@ -224,17 +224,30 @@ pub fn spawn_with_sockets(
     state.port_reservation = cfg.port_reservation;
     *state.local_icepwd.lock() = cfg.local_icepwd;
 
-    // Spawn the recv_loop — reads the socket continuously, classifies
-    // STUN/DTLS/RTP and feeds jitter/DTLS-mpsc immediately.
     let cancel = CancellationToken::new();
+
+    // DTLS keying material is published here once the handshake completes so
+    // the inbound RTCP readers can build their SRTCP decrypt context (Tier 2).
+    // Both the dedicated P+1 loop and — under rtcp-mux — the RTP recv_loop
+    // subscribe, so create the watch pair before spawning either.
+    let (srtp_key_tx, srtp_key_rx) = tokio::sync::watch::channel(None);
+    state.srtp_key_tx = Some(srtp_key_tx);
+
+    // Spawn the recv_loop — reads the RTP socket continuously, classifies
+    // STUN/DTLS/RTP and feeds jitter/DTLS-mpsc immediately. It also demuxes
+    // rtcp-mux'd RTCP (RFC 5761) off the RTP port, hence the RTCP accounting
+    // fields and the SRTCP key subscription.
     super::recv_loop::spawn(super::recv_loop::RecvLoopConfig {
         sock: state.rtp_sock.clone(),
         jitter: state.jitter.clone(),
         remote_addr: state.remote_addr.clone(),
         in_count: state.in_count.clone(),
         rx_stats: state.rx_stats.clone(),
+        remote_report: state.remote_report.clone(),
+        local_ssrc: state.ssrc,
         local_icepwd: state.local_icepwd.clone(),
         dtls_tx: state.dtls_inbound_tx.clone(),
+        key_rx: srtp_key_rx.clone(),
         cancel: cancel.clone(),
     });
 
@@ -245,6 +258,7 @@ pub fn spawn_with_sockets(
         rx_stats: state.rx_stats.clone(),
         remote_report: state.remote_report.clone(),
         local_ssrc: state.ssrc,
+        key_rx: srtp_key_rx,
         cancel: cancel.clone(),
     });
 
@@ -597,6 +611,10 @@ async fn run(
         });
     }
     subs.prebuffer.clear();
+    // RTCP BYE (Tier 2): tell the peer the stream is ending now, before we
+    // cancel the loops and drop the sockets. Best-effort; encrypted as SRTCP
+    // on a secure channel.
+    super::rtcp_tx::send_bye(state).await;
     // Abort any in-flight DTLS handshake task. Without this, a handshake
     // that hasn't completed (peer disappeared, no response, etc.) outlives
     // the channel and busy-spins the runtime: the task's mpsc senders are
@@ -736,6 +754,7 @@ async fn handle_command_local(
             state.set_remote_addr(cfg.addr);
             state.ticks_without_rtp = 0;
             state.remote_pt = cfg.payload_type;
+            state.rtcpmux = cfg.rtcpmux;
             state.codecx.set_negotiated_pt(cfg.payload_type);
             if let Some(pt) = cfg.rfc2833_payload_type {
                 state.rfc2833_pt = pt;

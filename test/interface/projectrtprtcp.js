@@ -66,7 +66,7 @@ describe( "rtcp", function() {
 
   it( "emits SR + SDES on P+1 and reflects a peer RR in the close stats", async function() {
 
-    /* RTCP first fires at tick 250 (~5s); allow headroom. */
+    /* Randomised first report fires ~1–3 s (half a randomised interval); headroom. */
     this.timeout( 9000 )
     this.slow( 8000 )
 
@@ -142,6 +142,121 @@ describe( "rtcp", function() {
     expect( r.out.jitter ).to.equal( 40 )
     /* LSR was 0 in the RR, so no RTT could be derived. */
     expect( r.rttms ).to.equal( null )
+  } )
+
+  it( "carries RTCP over the RTP port when rtcp-mux is negotiated (RFC 5761)", async function() {
+
+    /* Randomised first report fires ~1-3s; keep the P+1-test headroom. */
+    this.timeout( 9000 )
+    this.slow( 8000 )
+
+    const rtp = dgram.createSocket( "udp4" )
+    const rtcp = dgram.createSocket( "udp4" ) /* the P+1 port — must stay silent under mux */
+
+    /* Resolve on the first RTCP compound seen *on the RTP port* — demux by the
+       RTCP packet-type byte (200..=204), ignoring the echoed PCMU audio. */
+    let resolvesr
+    const gotsr = new Promise( ( res ) => { resolvesr = res } )
+    rtp.on( "message", ( m ) => {
+      if( 2 <= m.length && 200 <= m[ 1 ] && 204 >= m[ 1 ] ) resolvesr( m )
+    } )
+
+    let p1count = 0
+    rtcp.on( "message", () => { p1count++ } )
+
+    await new Promise( ( res ) => rtp.bind( res ) )
+    const peerport = rtp.address().port
+    await new Promise( ( res, rej ) =>
+      rtcp.bind( peerport + 1, ( e ) => ( e ? rej( e ) : res() ) ) )
+
+    let closestats
+    let resolveclose
+    const closed = new Promise( ( res ) => { resolveclose = res } )
+
+    const channel = await projectrtp.openchannel(
+      { "remote": { "address": "127.0.0.1", "port": peerport, "codec": 0, "rtcpmux": true } },
+      function( d ) {
+        if( "close" === d.action ) {
+          closestats = d.stats
+          resolveclose()
+        }
+      } )
+
+    expect( channel.echo() ).to.be.true
+    for( let i = 0; 50 > i; i++ ) sendpk( i, channel.local.port, rtp )
+
+    /* The channel's first RTCP compound — arriving on the RTP port, not P+1. */
+    const sr = await gotsr
+
+    expect( sr[ 0 ] >> 6 ).to.equal( 2 ) /* RTP version 2 */
+    const items = walkrtcp( sr )
+    expect( items[ 0 ].pt ).to.equal( 200 ) /* first sub-packet is an SR */
+    expect( items.some( ( it ) => 202 === it.pt ) ).to.be.true /* SDES present */
+    expect( sr.readUInt32BE( 4 ) ).to.equal( channel.local.ssrc >>> 0 )
+
+    /* Feed a crafted RR back over the *same* RTP port (mux) about our stream;
+       the recv_loop must demux it to the RTCP path and fold it. */
+    rtp.send(
+      buildrr( 25, channel.local.ssrc, 25, 12, 40 ),
+      channel.local.port, "127.0.0.1" )
+
+    await new Promise( ( r ) => setTimeout( r, 200 ) )
+    channel.close()
+    await closed
+
+    rtp.close()
+    rtcp.close()
+
+    /* The muxed RR was folded and surfaced in the close stats. */
+    expect( closestats ).to.have.property( "rtcp" )
+    expect( closestats.rtcp.out.valid ).to.equal( true )
+    expect( closestats.rtcp.out.fractionlost ).to.equal( 25 )
+    expect( closestats.rtcp.out.cumulativelost ).to.equal( 12 )
+    expect( closestats.rtcp.out.jitter ).to.equal( 40 )
+
+    /* Nothing should ever land on the separate P+1 control port under mux. */
+    expect( p1count ).to.equal( 0 )
+  } )
+
+  it( "sends an RTCP BYE (PT 203) on channel close", async function() {
+
+    this.timeout( 4000 )
+    this.slow( 3000 )
+
+    const rtp = dgram.createSocket( "udp4" )
+    const rtcp = dgram.createSocket( "udp4" )
+    rtp.on( "message", () => {} ) /* drain echoed audio */
+
+    await new Promise( ( res ) => rtp.bind( res ) )
+    const peerport = rtp.address().port
+    await new Promise( ( res, rej ) =>
+      rtcp.bind( peerport + 1, ( e ) => ( e ? rej( e ) : res() ) ) )
+
+    /* Resolve on the first compound that carries a BYE sub-packet. Closing
+       early (before the first periodic report) means the BYE is the only
+       datagram, but the filter is robust either way. */
+    let resolvebye
+    const gotbye = new Promise( ( res ) => { resolvebye = res } )
+    rtcp.on( "message", ( m ) => {
+      if( walkrtcp( m ).some( ( it ) => 203 === it.pt ) ) resolvebye( m )
+    } )
+
+    const channel = await projectrtp.openchannel(
+      { "remote": { "address": "127.0.0.1", "port": peerport, "codec": 0 } },
+      function() {} )
+
+    /* Feed a few packets so the channel latches the remote address, then close
+       — the BYE is emitted on the close path. */
+    expect( channel.echo() ).to.be.true
+    for( let i = 0; 10 > i; i++ ) sendpk( i, channel.local.port, rtp )
+    await new Promise( ( r ) => setTimeout( r, 300 ) )
+    channel.close()
+
+    const bye = await gotbye
+    expect( walkrtcp( bye ).some( ( it ) => 203 === it.pt ) ).to.be.true
+
+    rtp.close()
+    rtcp.close()
   } )
 
   it( "populates in.skip and lowers MOS when inbound packets are lost", function( done ) {
