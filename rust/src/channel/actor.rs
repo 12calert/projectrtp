@@ -979,7 +979,10 @@ async fn handle_command_local(
                 reason: Some("new".into()),
             });
 
-            if cfg.interrupt {
+            // Energy barge-in is only for the hard-interrupt mode. In concurrent
+            // mode inbound energy must NOT stop the prompt — the controller does
+            // that explicitly via `StopPlay` once it has an acceptable answer.
+            if cfg.interrupt && !cfg.concurrent {
                 if let Some(threshold) = cfg.bargein_power {
                     let mut ma = crate::firfilter::MaFilter::new();
                     if let Some(n) = cfg.bargein_packets {
@@ -1005,7 +1008,41 @@ async fn handle_command_local(
                 file_str,
             });
 
+            // Concurrent mode: open the recorder right now so it runs alongside
+            // the player. It stays gated by `start_above_power` (writes nothing
+            // until the caller speaks), and its min/max durations are measured
+            // from speech-start, so opening early is safe — it just means the
+            // power warm-up elapses during the prompt. The player keeps playing
+            // until `StopPlay`.
+            if cfg.concurrent {
+                let mut evs = Vec::new();
+                let _ = activate_pending_recorder(subs, &mut evs).await;
+                for ev in evs {
+                    events.post(ev);
+                }
+            }
+
             let _ = ack.send(());
+            LocalOutcome::Continue
+        }
+
+        Command::StopPlay => {
+            // Explicit "stop the prompt now". Leaves any running recorder alone;
+            // if a deferred pending recorder is still queued it is activated
+            // (parity with a natural play-end) so its capture isn't lost.
+            if subs.player.is_some() {
+                subs.player = None;
+                subs.bargein = None;
+                events.post(Event::Play {
+                    state: PlayState::End,
+                    reason: Some("stopped".into()),
+                });
+                let mut evs = Vec::new();
+                let _ = activate_pending_recorder(subs, &mut evs).await;
+                for ev in evs {
+                    events.post(ev);
+                }
+            }
             LocalOutcome::Continue
         }
 
@@ -1314,6 +1351,7 @@ mod tests {
             interrupt: false,
             bargein_power: None,
             bargein_packets: None,
+            concurrent: false,
         };
         handle.play_record(cfg).await.unwrap();
 
@@ -1384,6 +1422,82 @@ mod tests {
             !early_finish,
             "no Record::Finished should fire before Record::Recording: {:?}",
             observed
+        );
+
+        handle.close("done").await;
+        let _ = std::fs::remove_file(&rec_path);
+    }
+
+    /// Concurrent mode is the inverse of the deferred test above: the recorder
+    /// must open at command-accept time (running alongside the player), NOT at
+    /// play-end. With a non-gated recorder that surfaces as a `Record::Recording`
+    /// event emitted *before* the empty player's `Play::End`, whereas the
+    /// deferred path emits it after. Proves inbound energy is irrelevant to when
+    /// the recorder starts and that the player is left running.
+    #[tokio::test]
+    async fn playrecord_concurrent_opens_recorder_immediately() {
+        let (tx, mut rx) = tmpsc::unbounded_channel();
+        let sink = Arc::new(TestSink { tx });
+
+        let handle = spawn(SpawnConfig {
+            id: 8,
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ssrc: 1,
+            events: sink,
+            port_reservation: None,
+            local_icepwd: String::new(),
+        })
+        .await
+        .unwrap();
+
+        let rec_cfg = test_recorder_cfg("actor_playrecord_concurrent.wav");
+        let rec_path = rec_cfg.file.clone();
+        let rec_path_str = rec_path.to_string_lossy().into_owned();
+
+        let cfg = crate::channel::commands::PlayRecordConfig {
+            player: crate::channel::player::SoundSoupSpec {
+                files: vec![],
+                overall_loops: None,
+                interrupt: false,
+            },
+            // non-gated (start_above_power None) so activation emits Recording now
+            recorder: rec_cfg,
+            interrupt: false,
+            bargein_power: None,
+            bargein_packets: None,
+            concurrent: true,
+        };
+        handle.play_record(cfg).await.unwrap();
+
+        let mut observed: Vec<Event> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            observed.push(ev);
+        }
+
+        let rec_rec_idx = observed
+            .iter()
+            .position(|e| {
+                matches!(e, Event::Record { state: RecordState::Recording, file: Some(f), .. }
+                      if f == &rec_path_str)
+            })
+            .expect("expected Record::Recording (recorder opened immediately)");
+        let play_end_idx = observed
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Event::Play {
+                        state: PlayState::End,
+                        ..
+                    }
+                )
+            })
+            .expect("expected Play::End from the empty soup");
+
+        assert!(
+            rec_rec_idx < play_end_idx,
+            "concurrent: Record::Recording must precede Play::End (opened at command time): {observed:?}"
         );
 
         handle.close("done").await;
