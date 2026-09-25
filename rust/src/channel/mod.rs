@@ -27,6 +27,7 @@ pub mod mixer;
 pub mod player;
 pub mod recorder;
 pub mod recv_loop;
+pub mod relay;
 pub mod rtcp;
 pub mod rtcp_loop;
 pub mod rtcp_stats;

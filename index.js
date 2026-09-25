@@ -184,6 +184,14 @@ class proxy {
  * @property { function } playrecord
  * @property { function } stopplay
  * @property { function } direction
+ * @property { function } livestats - live media-flow counters (a Promise on a proxied channel):
+ *   { relay, in: { count, accepted, rtcp, decryptfailed, prekey }, out: { count, dropped, ptdropped },
+ *   streams: [ { source, ssrc, sourcessrc, pt } ] }. On a relay leg `streams` is its current outbound
+ *   stream mapping, read-only: one entry per stream it forwards - `source` the uuid of the channel the
+ *   stream comes from, `ssrc` the SSRC this leg sends it under (the leg's own local.ssrc for the first
+ *   source's main stream), `sourcessrc` the source's own SSRC, `pt` the payload type it goes out under.
+ *   A stream is listed once its first packet has been forwarded; what signalling needs to announce
+ *   (a=ssrc / msid) further streams to a receiver in a group of three or more
  * @property { object } local
  * @property { number } local.port
  * @property { number } local.ssrc
@@ -201,11 +209,23 @@ class proxy {
  * @param { Object } [ properties.remote ]
  * @param { number } properties.remote.port - the remote port - must be an Int and should be even
  * @param { string } properties.remote.address - the remote (remote) host address
- * @param { number } properties.remote.codec - the remote codec as a number
+ * @param { number } properties.remote.codec - the remote codec as a number. On a relay leg: the
+ *   payload type of the leg's primary (video) codec; a forwarded packet sent under the source leg's
+ *   primary PT goes out under this leg's primary PT
+ * @param { Object< string, number > } [ properties.remote.codecs ] - relay legs only: further codecs
+ *   the leg negotiated, as { <label>: pt }, e.g. { "vp8": 96, "h264/42e01f": 102 }. The label names
+ *   the codec (configuration) and must be the same on every leg for the same codec (compared
+ *   case-insensitively); a packet is forwarded under the receiving leg's PT for its label. A packet
+ *   whose PT the source leg does not declare, or whose codec the receiving leg does not declare, is
+ *   dropped and counted in livestats().out.ptdropped - never re-stamped. A leg that declares no codec
+ *   at all receives packets under their source PT. Also accepted by channel.remote(), which replaces
+ *   the leg's codec, codecs and remote together
  * @param { Object } [ properties.remote.dtls ]
  * @param { string } properties.remote.dtls.fingerprint - the fingerprint we verify the remote against
  * @param { string } properties.remote.dtls.setup - "active" or "passive"
  * @param { boolean } [ properties.remote.rtcpmux = false ] - RFC 5761 rtcp-mux: carry RTCP over the RTP port/5-tuple instead of the separate P+1 control port. Set from the SDP `a=rtcp-mux` attribute.
+ * @param { boolean } [ properties.relay = false ] - open a tick-free relay (video) leg: RTP is
+ *   forwarded to the other legs it is mix()ed with, never decoded
  * @param { Object } [ properties.direction ] - direction from our perspective
  * @param { boolean } [ properties.direction.send = true ]
  * @param { boolean } [ properties.direction.recv = true ]
@@ -431,7 +451,10 @@ class projectrtp {
     if( !params.forcelocal && server.interface.get() ) {
       return server.interface.get().openchannel( params, cb )
     } else {
-      const chan = actualprojectrtp.openchannel( params, ( d ) => {
+      /* the uuid goes to the native side too: a relay leg names its sources
+         by it in livestats().streams */
+      const uuid = uuidv4()
+      const chan = actualprojectrtp.openchannel( { ...params, uuid }, ( d ) => {
         try{
           if( chan.em ) {
             chan.em.emit( "all", d )
@@ -476,7 +499,7 @@ class projectrtp {
       if( params.id ) chan.id = params.id
       else chan.id = uuidv4()
 
-      chan.uuid = uuidv4()
+      chan.uuid = uuid
 
       /* ensure we are identicle to the node version of this object */
       chan.openchannel = this.openchannel.bind( this )
